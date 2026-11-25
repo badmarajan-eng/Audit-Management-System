@@ -1,0 +1,8 @@
+{
+  "name": "Kaveri Foods Order-to-Audit ERP",
+  "description": "End-to-end Order-to-Audit manufacturing, BOM, inventory ledger, GST invoicing, and financial reporting ERP for South Indian packaged food manufacturing.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

@@ -1,0 +1,599 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Global safety net: default-deny everything
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // --- Global Helpers ---
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isEmailVerified() {
+      return isSignedIn() && request.auth.token.email_verified == true;
+    }
+
+    function isBootstrapAdmin() {
+      return isEmailVerified() && request.auth.token.email == 'rajandemo63@gmail.com';
+    }
+
+    function userDocPath() {
+      return /databases/$(database)/documents/users/$(request.auth.uid);
+    }
+
+    function isActiveUser() {
+      return isBootstrapAdmin() || (
+        isEmailVerified() &&
+        exists(userDocPath()) &&
+        get(userDocPath()).data.active == true
+      );
+    }
+
+    function hasRole(allowedRoles) {
+      return isBootstrapAdmin() || (
+        isActiveUser() &&
+        get(userDocPath()).data.role in allowedRoles
+      );
+    }
+
+    function isValidMemberUids(list) {
+      return list is list && list.size() >= 1 && list.size() <= 50 && list[0] is string && list[0].size() <= 128;
+    }
+
+    function canListOrgDoc(data) {
+      return isEmailVerified() && (
+        isBootstrapAdmin() ||
+        (data.orgId == 'kaveri_foods' && request.auth.uid in data.memberUids)
+      );
+    }
+
+    function isOrgStaffForDoc(data) {
+      return isBootstrapAdmin() || (
+        isActiveUser() &&
+        data.orgId == 'kaveri_foods' &&
+        request.auth.uid in data.memberUids
+      );
+    }
+
+    // --- Connection Check Document ---
+    match /test/connection {
+      allow get: if isSignedIn();
+    }
+
+    // --- Users (PII Protected) ---
+    function isValidUserAccount(data) {
+      return data.keys().hasAll(['uid', 'email', 'displayName', 'role', 'active', 'orgId', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['uid', 'email', 'displayName', 'role', 'assignedSalesmanTag', 'active', 'orgId', 'createdAt', 'updatedAt'])
+        && data.uid is string && data.uid.size() >= 1 && data.uid.size() <= 128 && data.uid.matches('^[a-zA-Z0-9_\\-]+$')
+        && data.email is string && data.email.size() >= 3 && data.email.size() <= 200
+        && data.displayName is string && data.displayName.size() >= 1 && data.displayName.size() <= 120
+        && data.role in ['salesman', 'admin', 'supervisor', 'accountant', 'owner']
+        && (!('assignedSalesmanTag' in data) || (data.assignedSalesmanTag is string && data.assignedSalesmanTag.size() <= 80))
+        && data.active is bool
+        && data.orgId == 'kaveri_foods'
+        && data.createdAt is string && data.createdAt.size() <= 64
+        && data.updatedAt is string && data.updatedAt.size() <= 64;
+    }
+
+    match /users/{userId} {
+      allow get: if isEmailVerified() && isValidId(userId) && (request.auth.uid == userId || hasRole(['admin', 'owner', 'accountant']));
+      allow list: if isEmailVerified() && (isBootstrapAdmin() || resource.data.uid == request.auth.uid);
+      allow create: if isEmailVerified() && isValidId(userId) && isValidUserAccount(incoming()) && (
+        isBootstrapAdmin() ||
+        (request.auth.uid == userId && incoming().uid == request.auth.uid && incoming().role == 'salesman' && incoming().active == true)
+      );
+      allow update: if isEmailVerified() && isValidId(userId) && isValidUserAccount(incoming())
+        && incoming().uid == existing().uid
+        && incoming().createdAt == existing().createdAt
+        && incoming().orgId == existing().orgId
+        && (
+          isBootstrapAdmin() ||
+          hasRole(['admin', 'owner']) ||
+          (request.auth.uid == userId && incoming().diff(existing()).affectedKeys().hasOnly(['displayName', 'updatedAt']))
+        );
+      allow delete: if isBootstrapAdmin() && isValidId(userId);
+    }
+
+    // --- Company Settings ---
+    function isValidCompanySettings(data) {
+      return data.keys().hasAll(['companyName', 'legalName', 'gstin', 'address', 'state', 'stateCode', 'financialYear', 'valuationMethod', 'varianceTolerancePct', 'invoiceCounter', 'orgId', 'memberUids', 'updatedAt'])
+        && data.keys().hasOnly(['companyName', 'legalName', 'gstin', 'address', 'state', 'stateCode', 'financialYear', 'valuationMethod', 'varianceTolerancePct', 'invoiceCounter', 'orgId', 'memberUids', 'updatedAt'])
+        && data.companyName is string && data.companyName.size() >= 2 && data.companyName.size() <= 160
+        && data.legalName is string && data.legalName.size() >= 2 && data.legalName.size() <= 160
+        && data.gstin is string && data.gstin.size() == 15
+        && data.address is string && data.address.size() <= 300
+        && data.state is string && data.state.size() >= 2 && data.state.size() <= 80
+        && data.stateCode is string && data.stateCode.size() <= 4
+        && data.financialYear is string && data.financialYear.size() <= 16
+        && data.valuationMethod in ['WEIGHTED_AVERAGE', 'FIFO']
+        && data.varianceTolerancePct is number && data.varianceTolerancePct >= 0 && data.varianceTolerancePct <= 50
+        && data.invoiceCounter is number && data.invoiceCounter >= 0
+        && data.orgId == 'kaveri_foods'
+        && isValidMemberUids(data.memberUids)
+        && data.updatedAt is string && data.updatedAt.size() <= 64;
+    }
+
+    match /settings/{settingId} {
+      allow get: if isValidId(settingId) && isOrgStaffForDoc(existing());
+      allow list: if canListOrgDoc(resource.data);
+      allow create: if isValidId(settingId) && hasRole(['admin', 'owner']) && isValidCompanySettings(incoming());
+      allow update: if isValidId(settingId) && hasRole(['admin', 'owner']) && isValidCompanySettings(incoming()) && incoming().orgId == existing().orgId;
+      allow delete: if false;
+    }
+
+    // --- Products ---
+    function isValidProduct(data) {
+      return data.keys().hasAll(['id', 'code', 'name', 'category', 'sku', 'packSize', 'sellingPrice', 'gstRate', 'hsnCode', 'availableStock', 'reorderLevel', 'status', 'orgId', 'memberUids', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['id', 'code', 'name', 'category', 'sku', 'packSize', 'sellingPrice', 'gstRate', 'hsnCode', 'availableStock', 'reorderLevel', 'status', 'imageUrl', 'orgId', 'memberUids', 'createdAt', 'updatedAt'])
+        && isValidId(data.id)
+        && data.code is string && data.code.size() <= 32
+        && data.name is string && data.name.size() >= 2 && data.name.size() <= 120
+        && data.category in ['Savouries', 'Mixtures', 'Chips', 'Sweets']
+        && data.sku is string && data.sku.size() <= 40
+        && data.packSize is string && data.packSize.size() <= 32
+        && data.sellingPrice is number && data.sellingPrice >= 0
+        && data.gstRate is number && data.gstRate >= 0 && data.gstRate <= 28
+        && data.hsnCode is string && data.hsnCode.size() <= 16
+        && data.availableStock is number && data.availableStock >= 0
+        && data.reorderLevel is number && data.reorderLevel >= 0
+        && data.status in ['ACTIVE', 'INACTIVE']
+        && (!('imageUrl' in data) || (data.imageUrl is string && data.imageUrl.size() <= 300))
+        && data.orgId == 'kaveri_foods'
+        && isValidMemberUids(data.memberUids)
+        && data.createdAt is string && data.createdAt.size() <= 64
+        && data.updatedAt is string && data.updatedAt.size() <= 64;
+    }
+
+    match /products/{productId} {
+      allow get: if isValidId(productId) && isOrgStaffForDoc(existing());
+      allow list: if canListOrgDoc(resource.data);
+      allow create: if isValidId(productId) && hasRole(['admin', 'owner']) && isValidProduct(incoming());
+      allow update: if isValidId(productId) && isValidProduct(incoming()) && incoming().createdAt == existing().createdAt && incoming().orgId == existing().orgId && (
+        hasRole(['admin', 'owner']) ||
+        (hasRole(['supervisor']) && incoming().diff(existing()).affectedKeys().hasOnly(['availableStock', 'updatedAt']))
+      );
+      allow delete: if isBootstrapAdmin() && isValidId(productId);
+    }
+
+    // --- Materials (Raw & Packaging) ---
+    function isValidMaterial(data) {
+      return data.keys().hasAll(['id', 'code', 'name', 'category', 'unit', 'availableStock', 'reorderLevel', 'weightedAvgCost', 'lastPurchaseRate', 'status', 'orgId', 'memberUids', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['id', 'code', 'name', 'category', 'unit', 'availableStock', 'reorderLevel', 'weightedAvgCost', 'lastPurchaseRate', 'status', 'orgId', 'memberUids', 'createdAt', 'updatedAt'])
+        && isValidId(data.id)
+        && data.code is string && data.code.size() <= 32
+        && data.name is string && data.name.size() >= 2 && data.name.size() <= 120
+        && data.category in ['RAW_MATERIAL', 'PACKAGING']
+        && data.unit in ['kg', 'g', 'litre', 'ml', 'pieces', 'packets', 'cartons']
+        && data.availableStock is number && data.availableStock >= 0
+        && data.reorderLevel is number && data.reorderLevel >= 0
+        && data.weightedAvgCost is number && data.weightedAvgCost >= 0
+        && data.lastPurchaseRate is number && data.lastPurchaseRate >= 0
+        && data.status in ['ACTIVE', 'INACTIVE']
+        && data.orgId == 'kaveri_foods'
+        && isValidMemberUids(data.memberUids)
+        && data.createdAt is string && data.createdAt.size() <= 64
+        && data.updatedAt is string && data.updatedAt.size() <= 64;
+    }
+
+    match /materials/{materialId} {
+      allow get: if isValidId(materialId) && isOrgStaffForDoc(existing());
+      allow list: if canListOrgDoc(resource.data);
+      allow create: if isValidId(materialId) && hasRole(['admin', 'supervisor', 'owner']) && isValidMaterial(incoming());
+      allow update: if isValidId(materialId) && hasRole(['admin', 'supervisor', 'owner']) && isValidMaterial(incoming()) && incoming().createdAt == existing().createdAt && incoming().orgId == existing().orgId;
+      allow delete: if isBootstrapAdmin() && isValidId(materialId);
+    }
+
+    // --- Customers ---
+    function isValidCustomer(data) {
+      return data.keys().hasAll(['id', 'code', 'name', 'customerType', 'phone', 'email', 'gstin', 'billingAddress', 'shippingAddress', 'state', 'stateCode', 'assignedSalesman', 'outstandingBalance', 'status', 'orgId', 'memberUids', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['id', 'code', 'name', 'customerType', 'phone', 'email', 'gstin', 'billingAddress', 'shippingAddress', 'state', 'stateCode', 'assignedSalesman', 'outstandingBalance', 'status', 'orgId', 'memberUids', 'createdAt', 'updatedAt'])
+        && isValidId(data.id)
+        && data.code is string && data.code.size() <= 32
+        && data.name is string && data.name.size() >= 2 && data.name.size() <= 140
+        && data.customerType in ['Retailer', 'Distributor']
+        && data.phone is string && data.phone.size() <= 24
+        && data.email is string && data.email.size() <= 160
+        && data.gstin is string && data.gstin.size() <= 15
+        && data.billingAddress is string && data.billingAddress.size() <= 300
+        && data.shippingAddress is string && data.shippingAddress.size() <= 300
+        && data.state is string && data.state.size() >= 2 && data.state.size() <= 80
+        && data.stateCode is string && data.stateCode.size() <= 4
+        && data.assignedSalesman is string && data.assignedSalesman.size() <= 80
+        && data.outstandingBalance is number && data.outstandingBalance >= 0
+        && data.status in ['ACTIVE', 'INACTIVE']
+        && data.orgId == 'kaveri_foods'
+        && isValidMemberUids(data.memberUids)
+        && data.createdAt is string && data.createdAt.size() <= 64
+        && data.updatedAt is string && data.updatedAt.size() <= 64;
+    }
+
+    match /customers/{customerId} {
+      allow get: if isValidId(customerId) && isOrgStaffForDoc(existing());
+      allow list: if canListOrgDoc(resource.data);
+      allow create: if isValidId(customerId) && hasRole(['admin', 'owner']) && isValidCustomer(incoming());
+      allow update: if isValidId(customerId) && hasRole(['admin', 'owner']) && isValidCustomer(incoming()) && incoming().createdAt == existing().createdAt && incoming().orgId == existing().orgId;
+      allow delete: if isBootstrapAdmin() && isValidId(customerId);
+    }
+
+    // --- Suppliers ---
+    function isValidSupplier(data) {
+      return data.keys().hasAll(['id', 'code', 'name', 'phone', 'email', 'gstin', 'address', 'state', 'status', 'orgId', 'memberUids', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['id', 'code', 'name', 'phone', 'email', 'gstin', 'address', 'state', 'status', 'orgId', 'memberUids', 'createdAt', 'updatedAt'])
+        && isValidId(data.id)
+        && data.code is string && data.code.size() <= 32
+        && data.name is string && data.name.size() >= 2 && data.name.size() <= 140
+        && data.phone is string && data.phone.size() <= 24
+        && data.email is string && data.email.size() <= 160
+        && data.gstin is string && data.gstin.size() <= 15
+        && data.address is string && data.address.size() <= 300
+        && data.state is string && data.state.size() <= 80
+        && data.status in ['ACTIVE', 'INACTIVE']
+        && data.orgId == 'kaveri_foods'
+        && isValidMemberUids(data.memberUids)
+        && data.createdAt is string && data.createdAt.size() <= 64
+        && data.updatedAt is string && data.updatedAt.size() <= 64;
+    }
+
+    match /suppliers/{supplierId} {
+      allow get: if isValidId(supplierId) && isOrgStaffForDoc(existing());
+      allow list: if canListOrgDoc(resource.data);
+      allow create: if isValidId(supplierId) && hasRole(['admin', 'supervisor', 'owner']) && isValidSupplier(incoming());
+      allow update: if isValidId(supplierId) && hasRole(['admin', 'supervisor', 'owner']) && isValidSupplier(incoming()) && incoming().createdAt == existing().createdAt && incoming().orgId == existing().orgId;
+      allow delete: if isBootstrapAdmin() && isValidId(supplierId);
+    }
+
+    // --- BOMs ---
+    function isValidBom(data) {
+      return data.keys().hasAll(['id', 'code', 'productId', 'productName', 'version', 'expectedOutput', 'outputUnit', 'isActive', 'items', 'orgId', 'memberUids', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['id', 'code', 'productId', 'productName', 'version', 'expectedOutput', 'outputUnit', 'isActive', 'notes', 'items', 'orgId', 'memberUids', 'createdAt', 'updatedAt'])
+        && isValidId(data.id)
+        && data.code is string && data.code.size() <= 40
+        && isValidId(data.productId)
+        && data.productName is string && data.productName.size() <= 120
+        && data.version is string && data.version.size() <= 24
+        && data.expectedOutput is number && data.expectedOutput > 0
+        && data.outputUnit is string && data.outputUnit.size() <= 24
+        && data.isActive is bool
+        && (!('notes' in data) || (data.notes is string && data.notes.size() <= 300))
+        && data.items is list && data.items.size() >= 1 && data.items.size() <= 40
+        && data.orgId == 'kaveri_foods'
+        && isValidMemberUids(data.memberUids)
+        && data.createdAt is string && data.createdAt.size() <= 64
+        && data.updatedAt is string && data.updatedAt.size() <= 64;
+    }
+
+    match /boms/{bomId} {
+      allow get: if isValidId(bomId) && isOrgStaffForDoc(existing());
+      allow list: if canListOrgDoc(resource.data);
+      allow create: if isValidId(bomId) && hasRole(['supervisor', 'admin', 'owner']) && isValidBom(incoming())
+        && exists(/databases/$(database)/documents/products/$(incoming().productId));
+      allow update: if isValidId(bomId) && hasRole(['supervisor', 'admin', 'owner']) && isValidBom(incoming()) && incoming().createdAt == existing().createdAt && incoming().orgId == existing().orgId;
+      allow delete: if isBootstrapAdmin() && isValidId(bomId);
+    }
+
+    // --- Purchases ---
+    function isValidPurchase(data) {
+      return data.keys().hasAll(['id', 'purchaseNumber', 'purchaseDate', 'supplierId', 'supplierName', 'supplierInvoice', 'materialId', 'materialName', 'quantity', 'unit', 'rate', 'totalValue', 'recordedBy', 'recordedByName', 'orgId', 'memberUids', 'createdAt'])
+        && data.keys().hasOnly(['id', 'purchaseNumber', 'purchaseDate', 'supplierId', 'supplierName', 'supplierInvoice', 'materialId', 'materialName', 'quantity', 'unit', 'rate', 'totalValue', 'recordedBy', 'recordedByName', 'orgId', 'memberUids', 'createdAt'])
+        && isValidId(data.id)
+        && data.purchaseNumber is string && data.purchaseNumber.size() <= 40
+        && data.purchaseDate is string && data.purchaseDate.size() <= 24
+        && isValidId(data.supplierId)
+        && data.supplierName is string && data.supplierName.size() <= 140
+        && data.supplierInvoice is string && data.supplierInvoice.size() <= 64
+        && isValidId(data.materialId)
+        && data.materialName is string && data.materialName.size() <= 120
+        && data.quantity is number && data.quantity > 0
+        && data.unit is string && data.unit.size() <= 24
+        && data.rate is number && data.rate >= 0
+        && data.totalValue is number && data.totalValue >= 0
+        && data.recordedBy is string && data.recordedBy == request.auth.uid
+        && data.recordedByName is string && data.recordedByName.size() <= 120
+        && data.orgId == 'kaveri_foods'
+        && isValidMemberUids(data.memberUids)
+        && data.createdAt is string && data.createdAt.size() <= 64;
+    }
+
+    match /purchases/{purchaseId} {
+      allow get: if isValidId(purchaseId) && isOrgStaffForDoc(existing());
+      allow list: if canListOrgDoc(resource.data);
+      allow create: if isValidId(purchaseId) && hasRole(['supervisor', 'admin', 'owner']) && isValidPurchase(incoming())
+        && exists(/databases/$(database)/documents/suppliers/$(incoming().supplierId))
+        && exists(/databases/$(database)/documents/materials/$(incoming().materialId));
+      allow update: if false;
+      allow delete: if isBootstrapAdmin() && isValidId(purchaseId);
+    }
+
+    // --- Production Runs ---
+    function isValidProductionRun(data) {
+      return data.keys().hasAll(['id', 'runNumber', 'productionDate', 'productId', 'productName', 'bomId', 'bomVersion', 'batchSize', 'expectedOutput', 'goodOutput', 'damagedPouches', 'wastageQty', 'cartonsUsed', 'yieldVariancePct', 'hasVarianceAlert', 'consumptions', 'labourCost', 'electricityCost', 'gasCost', 'otherOverheadCost', 'materialCostTotal', 'packagingCostTotal', 'totalProductionCost', 'costPerPacket', 'supervisorName', 'recordedBy', 'orgId', 'memberUids', 'createdAt'])
+        && data.keys().hasOnly(['id', 'runNumber', 'productionDate', 'productId', 'productName', 'bomId', 'bomVersion', 'batchSize', 'expectedOutput', 'goodOutput', 'damagedPouches', 'wastageQty', 'cartonsUsed', 'yieldVariancePct', 'hasVarianceAlert', 'consumptions', 'labourCost', 'electricityCost', 'gasCost', 'otherOverheadCost', 'materialCostTotal', 'packagingCostTotal', 'totalProductionCost', 'costPerPacket', 'supervisorName', 'recordedBy', 'notes', 'orgId', 'memberUids', 'createdAt'])
+        && isValidId(data.id)
+        && data.runNumber is string && data.runNumber.size() <= 40
+        && data.productionDate is string && data.productionDate.size() <= 24
+        && isValidId(data.productId)
+        && data.productName is string && data.productName.size() <= 120
+        && isValidId(data.bomId)
+        && data.bomVersion is string && data.bomVersion.size() <= 24
+        && data.batchSize is number && data.batchSize > 0
+        && data.expectedOutput is number && data.expectedOutput > 0
+        && data.goodOutput is number && data.goodOutput >= 0
+        && data.damagedPouches is number && data.damagedPouches >= 0
+        && data.wastageQty is number && data.wastageQty >= 0
+        && data.cartonsUsed is number && data.cartonsUsed >= 0
+        && data.yieldVariancePct is number
+        && data.hasVarianceAlert is bool
+        && data.consumptions is list && data.consumptions.size() >= 1 && data.consumptions.size() <= 40
+        && data.labourCost is number && data.labourCost >= 0
+        && data.electricityCost is number && data.electricityCost >= 0
+        && data.gasCost is number && data.gasCost >= 0
+        && data.otherOverheadCost is number && data.otherOverheadCost >= 0
+        && data.materialCostTotal is number && data.materialCostTotal >= 0
+        && data.packagingCostTotal is number && data.packagingCostTotal >= 0
+        && data.totalProductionCost is number && data.totalProductionCost >= 0
+        && data.costPerPacket is number && data.costPerPacket >= 0
+        && data.supervisorName is string && data.supervisorName.size() <= 120
+        && data.recordedBy is string && data.recordedBy == request.auth.uid
+        && (!('notes' in data) || (data.notes is string && data.notes.size() <= 400))
+        && data.orgId == 'kaveri_foods'
+        && isValidMemberUids(data.memberUids)
+        && data.createdAt is string && data.createdAt.size() <= 64;
+    }
+
+    match /productionRuns/{runId} {
+      allow get: if isValidId(runId) && isOrgStaffForDoc(existing());
+      allow list: if canListOrgDoc(resource.data);
+      allow create: if isValidId(runId) && hasRole(['supervisor', 'admin', 'owner']) && isValidProductionRun(incoming())
+        && exists(/databases/$(database)/documents/products/$(incoming().productId))
+        && exists(/databases/$(database)/documents/boms/$(incoming().bomId));
+      allow update: if false;
+      allow delete: if isBootstrapAdmin() && isValidId(runId);
+    }
+
+    // --- Sales Orders ---
+    function isValidOrder(data) {
+      return data.keys().hasAll(['id', 'orderNumber', 'orderDate', 'customerId', 'customerName', 'customerType', 'customerState', 'customerGstin', 'salesmanId', 'salesmanName', 'items', 'taxableTotal', 'cgstTotal', 'sgstTotal', 'igstTotal', 'grandTotal', 'status', 'orgId', 'memberUids', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['id', 'orderNumber', 'orderDate', 'customerId', 'customerName', 'customerType', 'customerState', 'customerGstin', 'salesmanId', 'salesmanName', 'items', 'taxableTotal', 'cgstTotal', 'sgstTotal', 'igstTotal', 'grandTotal', 'status', 'rejectionReason', 'approvedBy', 'approvedAt', 'invoiceId', 'invoiceNumber', 'notes', 'orgId', 'memberUids', 'createdAt', 'updatedAt'])
+        && isValidId(data.id)
+        && data.orderNumber is string && data.orderNumber.size() <= 40
+        && data.orderDate is string && data.orderDate.size() <= 24
+        && isValidId(data.customerId)
+        && data.customerName is string && data.customerName.size() <= 140
+        && data.customerType in ['Retailer', 'Distributor']
+        && data.customerState is string && data.customerState.size() <= 80
+        && data.customerGstin is string && data.customerGstin.size() <= 15
+        && data.salesmanId is string && data.salesmanId.size() <= 128
+        && data.salesmanName is string && data.salesmanName.size() <= 120
+        && data.items is list && data.items.size() >= 1 && data.items.size() <= 30
+        && data.taxableTotal is number && data.taxableTotal >= 0
+        && data.cgstTotal is number && data.cgstTotal >= 0
+        && data.sgstTotal is number && data.sgstTotal >= 0
+        && data.igstTotal is number && data.igstTotal >= 0
+        && data.grandTotal is number && data.grandTotal >= 0
+        && data.status in ['Draft', 'Submitted', 'Approved', 'Rejected', 'Invoiced', 'Partially Dispatched', 'Dispatched', 'Cancelled']
+        && (!('rejectionReason' in data) || (data.rejectionReason is string && data.rejectionReason.size() <= 300))
+        && (!('approvedBy' in data) || (data.approvedBy is string && data.approvedBy.size() <= 128))
+        && (!('approvedAt' in data) || (data.approvedAt is string && data.approvedAt.size() <= 64))
+        && (!('invoiceId' in data) || (data.invoiceId is string && data.invoiceId.size() <= 64))
+        && (!('invoiceNumber' in data) || (data.invoiceNumber is string && data.invoiceNumber.size() <= 40))
+        && (!('notes' in data) || (data.notes is string && data.notes.size() <= 300))
+        && data.orgId == 'kaveri_foods'
+        && isValidMemberUids(data.memberUids)
+        && data.createdAt is string && data.createdAt.size() <= 64
+        && data.updatedAt is string && data.updatedAt.size() <= 64;
+    }
+
+    match /orders/{orderId} {
+      allow get: if isValidId(orderId) && isOrgStaffForDoc(existing());
+      allow list: if canListOrgDoc(resource.data);
+      allow create: if isValidId(orderId) && isValidOrder(incoming())
+        && exists(/databases/$(database)/documents/customers/$(incoming().customerId))
+        && (
+          hasRole(['admin', 'owner']) ||
+          (hasRole(['salesman']) && incoming().salesmanId == request.auth.uid && incoming().status in ['Draft', 'Submitted'])
+        );
+      allow update: if isValidId(orderId) && isValidOrder(incoming())
+        && incoming().createdAt == existing().createdAt
+        && incoming().orgId == existing().orgId
+        && (
+          hasRole(['admin', 'owner']) ||
+          (hasRole(['salesman'])
+            && existing().salesmanId == request.auth.uid
+            && existing().status in ['Draft', 'Submitted']
+            && incoming().status in ['Draft', 'Submitted', 'Cancelled']
+            && incoming().diff(existing()).affectedKeys().hasOnly(['items', 'taxableTotal', 'cgstTotal', 'sgstTotal', 'igstTotal', 'grandTotal', 'status', 'notes', 'updatedAt']))
+        );
+      allow delete: if isBootstrapAdmin() && isValidId(orderId);
+    }
+
+    // --- Invoices (Posted invoices cannot be deleted; cancel via Credit Note only) ---
+    function isValidInvoice(data) {
+      return data.keys().hasAll(['id', 'invoiceNumber', 'financialYear', 'invoiceDate', 'orderId', 'orderNumber', 'customerId', 'customerName', 'customerGstin', 'customerAddress', 'customerState', 'supplyType', 'items', 'taxableTotal', 'cgstTotal', 'sgstTotal', 'igstTotal', 'grandTotal', 'paidAmount', 'outstandingAmount', 'status', 'createdBy', 'orgId', 'memberUids', 'createdAt'])
+        && data.keys().hasOnly(['id', 'invoiceNumber', 'financialYear', 'invoiceDate', 'orderId', 'orderNumber', 'customerId', 'customerName', 'customerGstin', 'customerAddress', 'customerState', 'supplyType', 'items', 'taxableTotal', 'cgstTotal', 'sgstTotal', 'igstTotal', 'grandTotal', 'paidAmount', 'outstandingAmount', 'status', 'creditNoteNumber', 'creditNoteReason', 'creditNoteDate', 'createdBy', 'orgId', 'memberUids', 'createdAt'])
+        && isValidId(data.id)
+        && data.invoiceNumber is string && data.invoiceNumber.size() <= 40
+        && data.financialYear is string && data.financialYear.size() <= 16
+        && data.invoiceDate is string && data.invoiceDate.size() <= 24
+        && isValidId(data.orderId)
+        && data.orderNumber is string && data.orderNumber.size() <= 40
+        && isValidId(data.customerId)
+        && data.customerName is string && data.customerName.size() <= 140
+        && data.customerGstin is string && data.customerGstin.size() <= 15
+        && data.customerAddress is string && data.customerAddress.size() <= 300
+        && data.customerState is string && data.customerState.size() <= 80
+        && data.supplyType in ['INTRA_STATE', 'INTER_STATE']
+        && data.items is list && data.items.size() >= 1 && data.items.size() <= 30
+        && data.taxableTotal is number && data.taxableTotal >= 0
+        && data.cgstTotal is number && data.cgstTotal >= 0
+        && data.sgstTotal is number && data.sgstTotal >= 0
+        && data.igstTotal is number && data.igstTotal >= 0
+        && data.grandTotal is number && data.grandTotal >= 0
+        && data.paidAmount is number && data.paidAmount >= 0
+        && data.outstandingAmount is number && data.outstandingAmount >= 0
+        && data.status in ['POSTED', 'PARTIAL_PAID', 'PAID', 'CANCELLED_BY_CN']
+        && (!('creditNoteNumber' in data) || (data.creditNoteNumber is string && data.creditNoteNumber.size() <= 40))
+        && (!('creditNoteReason' in data) || (data.creditNoteReason is string && data.creditNoteReason.size() <= 300))
+        && (!('creditNoteDate' in data) || (data.creditNoteDate is string && data.creditNoteDate.size() <= 24))
+        && data.createdBy is string && data.createdBy == request.auth.uid
+        && data.orgId == 'kaveri_foods'
+        && isValidMemberUids(data.memberUids)
+        && data.createdAt is string && data.createdAt.size() <= 64;
+    }
+
+    match /invoices/{invoiceId} {
+      allow get: if isValidId(invoiceId) && isOrgStaffForDoc(existing());
+      allow list: if canListOrgDoc(resource.data);
+      allow create: if isValidId(invoiceId) && hasRole(['admin', 'owner']) && isValidInvoice(incoming())
+        && exists(/databases/$(database)/documents/orders/$(incoming().orderId))
+        && exists(/databases/$(database)/documents/customers/$(incoming().customerId));
+      allow update: if isValidId(invoiceId) && hasRole(['admin', 'owner']) && isValidInvoice(incoming())
+        && existing().status != 'CANCELLED_BY_CN'
+        && incoming().invoiceNumber == existing().invoiceNumber
+        && incoming().grandTotal == existing().grandTotal
+        && incoming().createdBy == existing().createdBy
+        && incoming().createdAt == existing().createdAt
+        && incoming().orgId == existing().orgId
+        && (
+          incoming().diff(existing()).affectedKeys().hasOnly(['paidAmount', 'outstandingAmount', 'status']) ||
+          incoming().diff(existing()).affectedKeys().hasOnly(['status', 'creditNoteNumber', 'creditNoteReason', 'creditNoteDate', 'outstandingAmount'])
+        );
+      allow delete: if false;
+    }
+
+    // --- Dispatches & Returns ---
+    function isValidDispatch(data) {
+      return data.keys().hasAll(['id', 'dispatchNumber', 'dispatchDate', 'orderId', 'orderNumber', 'customerId', 'customerName', 'type', 'items', 'dispatchedBy', 'orgId', 'memberUids', 'createdAt'])
+        && data.keys().hasOnly(['id', 'dispatchNumber', 'dispatchDate', 'orderId', 'orderNumber', 'invoiceId', 'invoiceNumber', 'customerId', 'customerName', 'type', 'items', 'vehicleNo', 'notes', 'dispatchedBy', 'orgId', 'memberUids', 'createdAt'])
+        && isValidId(data.id)
+        && data.dispatchNumber is string && data.dispatchNumber.size() <= 40
+        && data.dispatchDate is string && data.dispatchDate.size() <= 24
+        && isValidId(data.orderId)
+        && data.orderNumber is string && data.orderNumber.size() <= 40
+        && (!('invoiceId' in data) || (data.invoiceId is string && data.invoiceId.size() <= 64))
+        && (!('invoiceNumber' in data) || (data.invoiceNumber is string && data.invoiceNumber.size() <= 40))
+        && isValidId(data.customerId)
+        && data.customerName is string && data.customerName.size() <= 140
+        && data.type in ['DISPATCH', 'RETURN']
+        && data.items is list && data.items.size() >= 1 && data.items.size() <= 30
+        && (!('vehicleNo' in data) || (data.vehicleNo is string && data.vehicleNo.size() <= 40))
+        && (!('notes' in data) || (data.notes is string && data.notes.size() <= 300))
+        && data.dispatchedBy is string && data.dispatchedBy == request.auth.uid
+        && data.orgId == 'kaveri_foods'
+        && isValidMemberUids(data.memberUids)
+        && data.createdAt is string && data.createdAt.size() <= 64;
+    }
+
+    match /dispatches/{dispatchId} {
+      allow get: if isValidId(dispatchId) && isOrgStaffForDoc(existing());
+      allow list: if canListOrgDoc(resource.data);
+      allow create: if isValidId(dispatchId) && hasRole(['admin', 'owner']) && isValidDispatch(incoming())
+        && exists(/databases/$(database)/documents/orders/$(incoming().orderId));
+      allow update: if false;
+      allow delete: if isBootstrapAdmin() && isValidId(dispatchId);
+    }
+
+    // --- Payments ---
+    function isValidPayment(data) {
+      return data.keys().hasAll(['id', 'paymentNumber', 'paymentDate', 'invoiceId', 'invoiceNumber', 'customerId', 'customerName', 'amount', 'paymentMode', 'recordedBy', 'orgId', 'memberUids', 'createdAt'])
+        && data.keys().hasOnly(['id', 'paymentNumber', 'paymentDate', 'invoiceId', 'invoiceNumber', 'customerId', 'customerName', 'amount', 'paymentMode', 'referenceNo', 'notes', 'recordedBy', 'orgId', 'memberUids', 'createdAt'])
+        && isValidId(data.id)
+        && data.paymentNumber is string && data.paymentNumber.size() <= 40
+        && data.paymentDate is string && data.paymentDate.size() <= 24
+        && isValidId(data.invoiceId)
+        && data.invoiceNumber is string && data.invoiceNumber.size() <= 40
+        && isValidId(data.customerId)
+        && data.customerName is string && data.customerName.size() <= 140
+        && data.amount is number && data.amount > 0
+        && data.paymentMode in ['NEFT', 'UPI', 'Cheque', 'Cash', 'RTGS']
+        && (!('referenceNo' in data) || (data.referenceNo is string && data.referenceNo.size() <= 80))
+        && (!('notes' in data) || (data.notes is string && data.notes.size() <= 300))
+        && data.recordedBy is string && data.recordedBy == request.auth.uid
+        && data.orgId == 'kaveri_foods'
+        && isValidMemberUids(data.memberUids)
+        && data.createdAt is string && data.createdAt.size() <= 64;
+    }
+
+    match /payments/{paymentId} {
+      allow get: if isValidId(paymentId) && isOrgStaffForDoc(existing());
+      allow list: if canListOrgDoc(resource.data);
+      allow create: if isValidId(paymentId) && hasRole(['admin', 'owner']) && isValidPayment(incoming())
+        && exists(/databases/$(database)/documents/invoices/$(incoming().invoiceId))
+        && exists(/databases/$(database)/documents/customers/$(incoming().customerId));
+      allow update: if false;
+      allow delete: if isBootstrapAdmin() && isValidId(paymentId);
+    }
+
+    // --- Stock Ledger (Append-only) ---
+    function isValidStockLedgerEntry(data) {
+      return data.keys().hasAll(['id', 'itemId', 'itemName', 'itemCategory', 'unit', 'movementType', 'quantityDelta', 'balanceAfter', 'unitCost', 'totalValue', 'date', 'sourceDocument', 'sourceCollection', 'sourceId', 'recordedBy', 'recordedByName', 'orgId', 'memberUids', 'createdAt'])
+        && data.keys().hasOnly(['id', 'itemId', 'itemName', 'itemCategory', 'unit', 'movementType', 'quantityDelta', 'balanceAfter', 'unitCost', 'totalValue', 'date', 'sourceDocument', 'sourceCollection', 'sourceId', 'recordedBy', 'recordedByName', 'orgId', 'memberUids', 'createdAt'])
+        && isValidId(data.id)
+        && isValidId(data.itemId)
+        && data.itemName is string && data.itemName.size() <= 120
+        && data.itemCategory in ['RAW_MATERIAL', 'PACKAGING', 'FINISHED_GOOD']
+        && data.unit is string && data.unit.size() <= 24
+        && data.movementType in ['OPENING', 'PURCHASE', 'PRODUCTION_ISSUE', 'PRODUCTION_OUTPUT', 'PRODUCTION_DAMAGE', 'SALE_DISPATCH', 'SALES_RETURN', 'ADJUSTMENT']
+        && data.quantityDelta is number
+        && data.balanceAfter is number && data.balanceAfter >= 0
+        && data.unitCost is number && data.unitCost >= 0
+        && data.totalValue is number
+        && data.date is string && data.date.size() <= 24
+        && data.sourceDocument is string && data.sourceDocument.size() <= 64
+        && data.sourceCollection is string && data.sourceCollection.size() <= 40
+        && data.sourceId is string && data.sourceId.size() <= 64
+        && data.recordedBy is string && data.recordedBy == request.auth.uid
+        && data.recordedByName is string && data.recordedByName.size() <= 120
+        && data.orgId == 'kaveri_foods'
+        && isValidMemberUids(data.memberUids)
+        && data.createdAt is string && data.createdAt.size() <= 64;
+    }
+
+    match /stockLedger/{entryId} {
+      allow get: if isValidId(entryId) && isOrgStaffForDoc(existing());
+      allow list: if canListOrgDoc(resource.data);
+      allow create: if isValidId(entryId) && hasRole(['supervisor', 'admin', 'owner']) && isValidStockLedgerEntry(incoming());
+      allow update: if false;
+      allow delete: if isBootstrapAdmin() && isValidId(entryId);
+    }
+
+    // --- Audit Logs (Append-only) ---
+    function isValidAuditLog(data) {
+      return data.keys().hasAll(['id', 'action', 'entityType', 'entityId', 'summary', 'userId', 'userName', 'userRole', 'timestamp', 'orgId', 'memberUids', 'createdAt'])
+        && data.keys().hasOnly(['id', 'action', 'entityType', 'entityId', 'summary', 'userId', 'userName', 'userRole', 'timestamp', 'orgId', 'memberUids', 'createdAt'])
+        && isValidId(data.id)
+        && data.action is string && data.action.size() <= 80
+        && data.entityType is string && data.entityType.size() <= 64
+        && data.entityId is string && data.entityId.size() <= 64
+        && data.summary is string && data.summary.size() <= 300
+        && data.userId is string && data.userId == request.auth.uid
+        && data.userName is string && data.userName.size() <= 120
+        && data.userRole in ['salesman', 'admin', 'supervisor', 'accountant', 'owner']
+        && data.timestamp is string && data.timestamp.size() <= 64
+        && data.orgId == 'kaveri_foods'
+        && isValidMemberUids(data.memberUids)
+        && data.createdAt is string && data.createdAt.size() <= 64;
+    }
+
+    match /auditLogs/{logId} {
+      allow get: if isValidId(logId) && isOrgStaffForDoc(existing());
+      allow list: if canListOrgDoc(resource.data);
+      allow create: if isValidId(logId) && isActiveUser() && isValidAuditLog(incoming());
+      allow update: if false;
+      allow delete: if isBootstrapAdmin() && isValidId(logId);
+    }
+  }
+}
